@@ -1,5 +1,5 @@
 import { CST, isAlias, isMap, isNode, isScalar, isSeq, parseDocument, visit } from 'yaml'
-import type { Pair, YAMLMap, YAMLSeq } from 'yaml'
+import type { Pair, Scalar, YAMLMap, YAMLSeq } from 'yaml'
 
 import type { HermesConfig } from './hermes-config-yaml'
 import { HERMES_PLUGIN_NAME } from './hermes-managed-plugin-source'
@@ -18,21 +18,25 @@ function token(type: CST.SourceToken['type'], source: string): CST.SourceToken {
   return { type, source, offset: 0, indent: 0 }
 }
 
-function assertEditable(node: unknown, aliases: Set<string>, recursive = false): void {
+function assertEditable(
+  node: unknown,
+  aliasedNodes: Set<Scalar | YAMLMap | YAMLSeq>,
+  recursive = false
+): void {
   if (!isNode(node)) {
     return
   }
-  if (isAlias(node) || ('anchor' in node && node.anchor && aliases.has(node.anchor))) {
+  if (isAlias(node) || aliasedNodes.has(node)) {
     throw new Error('Cannot safely edit aliased Hermes plugin settings')
   }
   if (recursive && isSeq(node)) {
     for (const item of node.items) {
-      assertEditable(item, aliases, true)
+      assertEditable(item, aliasedNodes, true)
     }
   } else if (recursive && isMap(node)) {
     for (const pair of node.items) {
-      assertEditable(pair.key, aliases, true)
-      assertEditable(pair.value, aliases, true)
+      assertEditable(pair.key, aliasedNodes, true)
+      assertEditable(pair.value, aliasedNodes, true)
     }
   }
 }
@@ -71,12 +75,18 @@ function editSequence(sequence: YAMLSeq, next: string[], newline: string): Edit 
   if (!source || (source.type !== 'block-seq' && source.type !== 'flow-collection')) {
     throw new Error('Cannot locate Hermes plugin list in YAML source')
   }
-  const original = CST.stringify(source)
+  // A block-list footer may also own the next key's indentation; leave it outside the edit.
+  const sourceItems =
+    source.type === 'block-seq' ? source.items.filter((item) => item.value) : source.items
+  const original =
+    source.type === 'block-seq'
+      ? sourceItems.map((item) => CST.stringify(item)).join('')
+      : CST.stringify(source)
   const removeOrca = !next.includes(HERMES_PLUGIN_NAME)
   const appendOrca =
     next.includes(HERMES_PLUGIN_NAME) &&
     !sequence.items.some((item) => isScalar(item) && item.value === HERMES_PLUGIN_NAME)
-  const items = source.items.flatMap<CST.CollectionItem>((item, index) => {
+  const items = sourceItems.flatMap<CST.CollectionItem>((item, index) => {
     const node = sequence.items[index]
     if (removeOrca && isScalar(node) && node.value === HERMES_PLUGIN_NAME) {
       // A flow item's leading comment can describe the preceding, retained plugin.
@@ -135,9 +145,9 @@ function editField(
   value: unknown,
   content: string,
   newline: string,
-  aliases: Set<string>
+  aliasedNodes: Set<Scalar | YAMLMap | YAMLSeq>
 ): Edit {
-  assertEditable(pair.value, aliases, true)
+  assertEditable(pair.value, aliasedNodes, true)
   if (
     isSeq(pair.value) &&
     pair.value.items.every((item) => isScalar(item) && typeof item.value === 'string') &&
@@ -168,14 +178,17 @@ export function editHermesPluginLists(
     throw document.errors[0]
   }
   const newline = content.includes('\r\n') ? '\r\n' : '\n'
-  const aliases = new Set<string>()
+  const aliasedNodes = new Set<Scalar | YAMLMap | YAMLSeq>()
   visit(document, {
     Alias: (_, node) => {
-      aliases.add(node.source)
+      const target = node.resolve(document)
+      if (target) {
+        aliasedNodes.add(target)
+      }
     }
   })
   const root = document.contents
-  assertEditable(root, aliases)
+  assertEditable(root, aliasedNodes)
   const edits: Edit[] = []
   if (!isMap(root)) {
     const start = root?.range?.[0] ?? document.range?.[1] ?? content.length
@@ -190,9 +203,9 @@ export function editHermesPluginLists(
     if (!pluginsPair) {
       edits.push(insertFields(root, [['plugins', nextPlugins]], newline))
     } else {
-      assertEditable(pluginsPair.value, aliases)
+      assertEditable(pluginsPair.value, aliasedNodes)
       if (!isMap(pluginsPair.value)) {
-        assertEditable(pluginsPair.value, aliases, true)
+        assertEditable(pluginsPair.value, aliasedNodes, true)
         edits.push(replaceValue(pluginsPair, nextPlugins, content))
       } else {
         const missing: [PluginField, unknown][] = []
@@ -201,7 +214,7 @@ export function editHermesPluginLists(
             (item) => isScalar(item.key) && item.key.value === field
           )
           if (pair) {
-            edits.push(editField(pair, nextPlugins[field], content, newline, aliases))
+            edits.push(editField(pair, nextPlugins[field], content, newline, aliasedNodes))
           } else {
             missing.push([field, nextPlugins[field]])
           }
