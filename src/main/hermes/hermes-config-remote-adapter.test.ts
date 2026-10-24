@@ -47,9 +47,15 @@ describe('Hermes remote installer through a local filesystem adapter (no SSH)', 
   })
 
   it('keeps edits made during an already-configured remote install', async () => {
-    const initial = 'model: initial\nplugins:\n  enabled: [orca-status]\n'
-    const updated = initial.replace('model: initial', 'model: operator-edited')
-    writeFileSync(configPath, initial)
+    writeFileSync(configPath, 'model: initial\n')
+    // Why: derive "already configured" from a real install so the fixture tracks managed-config changes.
+    await service.installRemote(createManagedHookLocalFilesystem(), directory)
+    rmSync(join(directory, '.hermes', 'plugins'), { recursive: true })
+    const updated = readFileSync(configPath, 'utf8').replace(
+      'model: initial',
+      'model: operator-edited'
+    )
+    expect(updated).toContain('model: operator-edited')
     const filesystem = createManagedHookLocalFilesystem()
     const rename = filesystem.ext_openssh_rename.bind(filesystem)
     filesystem.ext_openssh_rename = (source, destination, callback) => {
